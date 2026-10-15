@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { users } from "@/db/schema";
-import { hashPassword } from "@/lib/crypto";
+import { verifyPassword } from "@/lib/crypto";
 import { createSession } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
@@ -17,6 +17,10 @@ export async function POST(req: NextRequest) {
     const [user] = await db.select().from(users).where(eq(users.email, email.toLowerCase().trim()));
     if (!user) {
       return NextResponse.json({ error: "حسابی با این ایمیل پیدا نشد" }, { status: 401 });
+    }
+
+    if (!verifyPassword(password, user.passwordHash)) {
+      return NextResponse.json({ error: "رمز عبور اشتباه است" }, { status: 401 });
     }
 
     await createSession(user.id);

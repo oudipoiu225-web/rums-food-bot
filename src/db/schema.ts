@@ -20,11 +20,25 @@ export const users = pgTable(
     name: text("name").notNull().default(""),
     // هش رمز با scrypt (فرمت: salt:hash هر دو base64url)
     passwordHash: text("password_hash").notNull(),
+    telegramId: text("telegram_id").unique(),
     isAdmin: boolean("is_admin").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [index("users_email_idx").on(table.email)],
 );
+
+/**
+ * وضعیت گفت‌وگوی تلگرام هر کاربر (ماشین حالت ربات)
+ */
+export const telegramStates = pgTable("telegram_states", {
+  telegramId: text("telegram_id").primaryKey(),
+  userId: integer("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  state: text("state").notNull().default("idle"),
+  data: jsonb("data").$type<Record<string, unknown>>().default({}).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 /**
  * نشست‌های ورود به پنل

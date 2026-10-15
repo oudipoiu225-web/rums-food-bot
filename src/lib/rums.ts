@@ -11,6 +11,7 @@ import {
   todayIso,
   WEEKDAY_NAMES,
 } from "@/lib/jalali";
+import { ProxyAgent } from "undici";
 
 export type MealKey = "breakfast" | "lunch" | "dinner";
 
@@ -61,6 +62,17 @@ export type EngineOptions = {
 
 /** برای میزبان‌هایی که از سرور ما در دسترس نیستند، سریع‌تر جا بزنیم */
 const DEFAULT_TIMEOUT = 8_000;
+
+/** Iranian egress: when RUMS_PROXY is set (e.g. http://ip:port), all RumsHttp
+ *  traffic goes through undici ProxyAgent (self.rums.ac.ir is unreachable
+ *  from foreign IPs). */
+const RUMS_PROXY = (process.env.RUMS_PROXY ?? "").trim();
+let proxyAgent: ProxyAgent | null = null;
+function getProxyDispatcher(): ProxyAgent | undefined {
+  if (!RUMS_PROXY) return undefined;
+  if (!proxyAgent) proxyAgent = new ProxyAgent(RUMS_PROXY);
+  return proxyAgent;
+}
 
 /* ------------------------------------------------------------------ */
 /* ابزارهای عمومی                                                      */
@@ -170,12 +182,13 @@ export class RumsHttp {
         ...init,
         redirect: "manual",
         signal: controller.signal,
+        ...(RUMS_PROXY ? { dispatcher: getProxyDispatcher() } : {}),
         headers: {
           ...this.headers,
           ...(this.cookieHeader() ? { cookie: this.cookieHeader() } : {}),
           ...((init.headers as Record<string, string>) ?? {}),
         },
-      });
+      } as RequestInit & { dispatcher?: unknown });
       this.storeCookies(res);
       const text = await res.text().catch(() => "");
       this.reachable = true;
@@ -345,7 +358,7 @@ export function pickFood(
 /* ------------------------------------------------------------------ */
 
 export async function notifyTelegram(profile: Profile, text: string): Promise<void> {
-  const token = profile.telegramToken;
+  const token = profile.telegramToken ?? process.env.TELEGRAM_BOT_TOKEN;
   const chatId = profile.telegramChatId;
   if (!token || !chatId) return;
   try {

@@ -67,6 +67,12 @@ const DEFAULT_TIMEOUT = 8_000;
  *  traffic goes through undici ProxyAgent (self.rums.ac.ir is unreachable
  *  from foreign IPs). */
 const RUMS_PROXY = (process.env.RUMS_PROXY ?? "").trim();
+
+/** Iranian relay: when RUMS_RELAY_URL and RUMS_RELAY_KEY are set, all RumsHttp
+ *  traffic goes through the PHP relay on the Iranian hosting instead of direct.
+ *  This solves the geoblock (self.rums.ac.ir unreachable from foreign IPs). */
+const RUMS_RELAY_URL = (process.env.RUMS_RELAY_URL ?? "").trim();
+const RUMS_RELAY_KEY = (process.env.RUMS_RELAY_KEY ?? "").trim();
 let proxyAgent: ProxyAgent | null = null;
 function getProxyDispatcher(): ProxyAgent | undefined {
   if (!RUMS_PROXY) return undefined;
@@ -169,11 +175,103 @@ export class RumsHttp {
     }
   }
 
+  /** Send request through the Iranian relay instead of direct */
+  private async relayRequest(
+    url: string,
+    init: RequestInit = {},
+    timeoutMs = DEFAULT_TIMEOUT,
+  ): Promise<{ ok: boolean; status: number; text: string; url: string } | null> {
+    // استخراج path از URL
+    let path = url;
+    try {
+      const u = new URL(resolveUrl(this.base, url));
+      path = u.pathname + u.search;
+    } catch { /* use as-is */ }
+    
+    const method = (init.method ?? "GET").toUpperCase();
+    let body: string | null = null;
+    if (init.body) {
+      body = typeof init.body === "string" ? init.body : String(init.body);
+    }
+    
+    const headers: Record<string, string> = {};
+    const h = init.headers as Record<string, string> | undefined;
+    if (h) {
+      for (const [k, v] of Object.entries(h)) {
+        const kl = k.toLowerCase();
+        if (["host", "content-length", "connection", "cookie"].includes(kl)) continue;
+        headers[k] = String(v);
+      }
+    }
+    
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(RUMS_RELAY_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          key: RUMS_RELAY_KEY,
+          method,
+          path,
+          body,
+          headers,
+          cookies: this.cookieHeader() || "",
+        }),
+        signal: controller.signal,
+      });
+      
+      if (!res.ok) {
+        this.lastError = `Relay HTTP ${res.status}`;
+        return null;
+      }
+      
+      const data = await res.json() as {
+        ok: boolean; status: number; body: string;
+        cookies?: string[]; error?: string;
+      };
+      
+      if (!data.ok) {
+        this.lastError = `Relay error: ${data.error}`;
+        return null;
+      }
+      
+      // ذخیره کوکی‌های جدید
+      if (data.cookies) {
+        for (const c of data.cookies) {
+          // ساخت Response مصنوعی برای storeCookies
+          const fakeHeaders = new Headers();
+          fakeHeaders.append("set-cookie", c);
+          this.storeCookies({ headers: fakeHeaders } as Response);
+        }
+      }
+      
+      this.reachable = true;
+      this.lastError = null;
+      const target = resolveUrl(this.base, url);
+      return {
+        ok: data.status >= 200 && data.status < 400,
+        status: data.status,
+        text: data.body ?? "",
+        url: target,
+      };
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async request(
     url: string,
     init: RequestInit = {},
     timeoutMs = DEFAULT_TIMEOUT,
   ): Promise<{ ok: boolean; status: number; text: string; url: string } | null> {
+    // اگر رله تنظیم شده، از اون استفاده کن
+    if (RUMS_RELAY_URL && RUMS_RELAY_KEY) {
+      return this.relayRequest(url, init, timeoutMs);
+    }
     const target = resolveUrl(this.base, url);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);

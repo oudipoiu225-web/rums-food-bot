@@ -1,10 +1,10 @@
 // src/lib/bot.ts — Telegram bot for rums-food-bot (نسخه ۲: با انتخاب غذای دقیق)
 import { db } from "@/db";
-import { users, profiles, plans, runs, reservations, telegramStates, userInfo, foodPreferences, weeklyMenuCache } from "@/db/schema";
+import { users, profiles, plans, reservations, telegramStates, userInfo, foodPreferences, weeklyMenuCache } from "@/db/schema";
 import { eq, desc, and } from "drizzle-orm";
-import { encryptSecret, hashPassword, decryptSecret } from "@/lib/crypto";
-import { probeProfile, executePlan, fetchUserProfileInfo, fetchWeeklyMenu, MEAL_LABEL, MEAL_KEYS, type MealKey, type FoodOption } from "@/lib/rums";
-import { schedulePlan } from "@/lib/scheduler";
+import { encryptSecret, hashPassword } from "@/lib/crypto";
+import { probeProfile, fetchUserProfileInfo, fetchWeeklyMenu, MEAL_LABEL, MEAL_KEYS, type MealKey } from "@/lib/rums";
+// schedulePlan removed - not used in v2
 import { randomBytes } from "crypto";
 import { addDaysIso, todayIso, isoToJalali, persianWeekday } from "@/lib/jalali";
 
@@ -298,7 +298,7 @@ function mealPickerKeyboard(day: number) {
   };
 }
 
-async function handleAutoDay(chatId: number, msgId: number, cbId: string, day: number, profileId: number) {
+async function handleAutoDay(chatId: number, msgId: number, cbId: string, day: number) {
   await tgAnswerCb(cbId);
   await tgApi("editMessageText", {
     chat_id: chatId, message_id: msgId,
@@ -486,11 +486,11 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
         reply_markup: dayPickerKeyboard(),
       });
     } else if (cbData === "autoday") {
-      await handleAutoDay(chatId, msgId, cb.id, parseInt(args[0]), profile.id);
+      await handleAutoDay(chatId, msgId, cb.id, parseInt(args[0]));
     } else if (cbData === "automeal") {
       await handleAutoMeal(chatId, msgId, cb.id, parseInt(args[0]), args[1], profile.id);
     } else if (cbData === "autofood") {
-      const { state } = await getState(tgId);
+      await getState(tgId); // state not needed here
       await handleAutoFood(chatId, msgId, cb.id, parseInt(args[0]), args[1], args[2], tgId, user.id);
     } else if (cbData === "auto" && args[0] === "view") {
       await viewAutomation(chatId, msgId, cb.id, profile.id);

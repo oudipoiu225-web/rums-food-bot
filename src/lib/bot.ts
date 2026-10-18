@@ -530,3 +530,6 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
     }
   }
 }
+
+// Alias برای سازگاری با webhook قدیمی
+export { handleUpdate as handleTelegramUpdate };

@@ -1,6 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { plans, profiles, reservations, runs } from "@/db/schema";
+import { plans, profiles, reservations, runs, foodPreferences } from "@/db/schema";
 import type { Plan, Profile } from "@/db/schema";
 import { decryptSecret } from "@/lib/crypto";
 import {
@@ -844,23 +844,40 @@ export async function executePlan(params: {
   let skipped = 0;
   let failed = 0;
 
+  // ترجیحات غذایی دقیق کاربر (نسخه ۲)
+  const prefs = await db.select().from(foodPreferences).where(eq(foodPreferences.profileId, profile.id));
+  const prefMap = new Map(prefs.map(p => [`${p.dayOfWeek}|${p.meal}`, p]));
+
   const targets: FoodOption[] = [];
   for (const date of days) {
     const dayItems = items.filter((i) => i.date === date);
+    const wd = persianWeekday(date);
     for (const meal of meals) {
       const key = `${date}|${meal}`;
       if (alreadyBooked.has(key)) {
         skipped += 1;
-        log("info", `${isoToJalali(date)} â€“ ${MEAL_LABEL[meal]}: ظ‚ط¨ظ„ط§ظ‹ ط¯ط± ط§غŒظ† ط³ط§ظ…ط§ظ†ظ‡ ط«ط¨طھ ط´ط¯ظ‡ ط§ط³طھ`);
+        log("info", `${isoToJalali(date)} – ${MEAL_LABEL[meal]}: قبلاً در این سامانه ثبت شده است`);
         continue;
       }
-      const chosen = pickFood(dayItems.filter((i) => i.meal === meal), {
-        foodPreference: plan?.foodPreference ?? "first",
-        maxPrice: plan?.maxPrice ?? 0,
-      });
+      // اول چک کن کاربر برای این روز/وعده غذای خاصی انتخاب کرده یا نه
+      const pref = prefMap.get(`${wd}|${meal}`);
+      let chosen: FoodOption | null = null;
+      if (pref?.foodName) {
+        // دنبال غذای انتخاب‌شده بگرد
+        chosen = dayItems.find(i => i.meal === meal && (i.name === pref.foodName || i.id === pref.foodId)) || null;
+        if (chosen) {
+          log("info", `${isoToJalali(date)} – ${MEAL_LABEL[meal]}: غذای انتخابی کاربر: ${chosen.name}`);
+        }
+      }
+      if (!chosen) {
+        chosen = pickFood(dayItems.filter((i) => i.meal === meal), {
+          foodPreference: plan?.foodPreference ?? "first",
+          maxPrice: plan?.maxPrice ?? 0,
+        });
+      }
       if (!chosen) {
         failed += 1;
-        log("warn", `${isoToJalali(date)} â€“ ${MEAL_LABEL[meal]}: ط؛ط°ط§غŒ ظ…ط·ط§ط¨ظ‚غŒ ظ¾غŒط¯ط§ ظ†ط´ط¯`);
+        log("warn", `${isoToJalali(date)} – ${MEAL_LABEL[meal]}: غذای مطابقی پیدا نشد`);
         continue;
       }
       targets.push(chosen);
@@ -945,4 +962,85 @@ export async function executePlan(params: {
   );
 
   return { runId: insertedRun.id, status, simulated, booked, skipped, failed, message, steps, items };
+}
+
+/* ------------------------------------------------------------------ */
+/* اطلاعات پروفایل و منوی هفتگی (نسخه ۲)                                */
+/* ------------------------------------------------------------------ */
+
+export type UserProfileInfo = {
+  fullName: string;
+  balance: number; // تومان
+  studentId?: string;
+};
+
+/** بعد از لاگین موفق، نام و موجودی کاربر رو از سامانه می‌گیره */
+export async function fetchUserProfileInfo(
+  profile: Profile,
+): Promise<UserProfileInfo | null> {
+  const client = new RumsHttp(profile.baseUrl, {
+    cookie: profile.sessionCookie,
+    userAgent: profile.userAgent,
+  });
+
+  // اول لاگین کن
+  const steps: Step[] = [];
+  const log = createLogger(steps);
+  const loginRes = await tryLogin(profile, client, log);
+  if (!loginRes.ok && !client.reachable) return null;
+
+  // سعی کن پروفایل رو از endpointهای رایج بگیری
+  const profilePaths = [
+    "/api/user/profile",
+    "/api/profile",
+    "/User/Profile",
+    "/Account/Info",
+    "/Home/UserInfo",
+  ];
+
+  for (const path of profilePaths) {
+    const res = await client.request(path);
+    if (!res?.ok) continue;
+    try {
+      const data = JSON.parse(res.text);
+      // ساختارهای رایج
+      const name =
+        data.fullName || data.full_name || data.name || data.userName ||
+        data.data?.fullName || data.data?.name || "";
+      const balance =
+        data.balance ?? data.credit ?? data.mojoodi ??
+        data.data?.balance ?? data.data?.credit ?? 0;
+      if (name || balance) {
+        return {
+          fullName: String(name || "دانشجو"),
+          balance: Number(balance) || 0,
+          studentId: data.studentId || data.student_id || data.code,
+        };
+      }
+    } catch { /* JSON نبود، ادامه بده */ }
+  }
+
+  // اگه پیدا نشد، از روی کوکی/سشن حداقل نام کاربری رو برگردون
+  return {
+    fullName: profile.username,
+    balance: 0,
+  };
+}
+
+/** منوی هفتگی واقعی رو می‌گیره (با غذاهای هر روز) */
+export async function fetchWeeklyMenu(
+  profile: Profile,
+  days: string[],
+): Promise<FoodOption[]> {
+  const client = new RumsHttp(profile.baseUrl, {
+    cookie: profile.sessionCookie,
+    userAgent: profile.userAgent,
+  });
+
+  const steps: Step[] = [];
+  const log = createLogger(steps);
+  await tryLogin(profile, client, log);
+
+  const { items } = await fetchMenuItems(profile, client, days, MEAL_KEYS, log);
+  return items;
 }

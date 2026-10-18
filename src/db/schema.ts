@@ -182,3 +182,63 @@ export type Plan = typeof plans.$inferSelect;
 export type NewPlan = typeof plans.$inferInsert;
 export type Run = typeof runs.$inferSelect;
 export type Reservation = typeof reservations.$inferSelect;
+
+/**
+ * اطلاعات پروفایل کاربر از سامانه سلف (نام، موجودی) - بعد از لاگین پر می‌شه
+ */
+export const userInfo = pgTable(
+  "user_info",
+  {
+    id: serial("id").primaryKey(),
+    profileId: integer("profile_id")
+      .notNull()
+      .references(() => profiles.id, { onDelete: "cascade" })
+      .unique(),
+    fullName: text("full_name"),
+    balance: integer("balance"), // موجودی به تومان
+    studentId: text("student_id"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+);
+
+/**
+ * ترجیحات غذایی دقیق: برای هر روز هفته و هر وعده، کدوم غذا
+ * dayOfWeek: 0=شنبه، 1=یکشنبه، ... 6=جمعه
+ */
+export const foodPreferences = pgTable(
+  "food_preferences",
+  {
+    id: serial("id").primaryKey(),
+    profileId: integer("profile_id")
+      .notNull()
+      .references(() => profiles.id, { onDelete: "cascade" }),
+    dayOfWeek: integer("day_of_week").notNull(),
+    meal: text("meal").notNull(), // breakfast/lunch/dinner
+    foodName: text("food_name"),
+    foodId: text("food_id"),
+    autoReserve: boolean("auto_reserve").notNull().default(true),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("food_prefs_profile_idx").on(table.profileId, table.dayOfWeek, table.meal)],
+);
+
+/**
+ * کش منوی هفتگی
+ */
+export const weeklyMenuCache = pgTable(
+  "weekly_menu_cache",
+  {
+    id: serial("id").primaryKey(),
+    profileId: integer("profile_id")
+      .notNull()
+      .references(() => profiles.id, { onDelete: "cascade" }),
+    weekStart: text("week_start").notNull(), // YYYY-MM-DD شنبه
+    menuData: jsonb("menu_data").$type<FoodOption[]>().notNull().default([]),
+    cachedAt: timestamp("cached_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("menu_cache_idx").on(table.profileId, table.weekStart)],
+);
+
+export type UserInfo = typeof userInfo.$inferSelect;
+export type FoodPreference = typeof foodPreferences.$inferSelect;
+export type WeeklyMenuCache = typeof weeklyMenuCache.$inferSelect;

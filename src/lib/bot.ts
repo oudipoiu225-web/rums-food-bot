@@ -1,43 +1,21 @@
-// src/lib/bot.ts — Telegram bot for rums-food-bot (Food_rums_bot)
+// src/lib/bot.ts — Telegram bot for rums-food-bot (نسخه ۲: با انتخاب غذای دقیق)
 import { db } from "@/db";
-import { users, profiles, plans, runs, telegramStates } from "@/db/schema";
-import { eq, desc } from "drizzle-orm";
-import { encryptSecret, hashPassword } from "@/lib/crypto";
-import { probeProfile, executePlan } from "@/lib/rums";
+import { users, profiles, plans, runs, reservations, telegramStates, userInfo, foodPreferences, weeklyMenuCache } from "@/db/schema";
+import { eq, desc, and } from "drizzle-orm";
+import { encryptSecret, hashPassword, decryptSecret } from "@/lib/crypto";
+import { probeProfile, executePlan, fetchUserProfileInfo, fetchWeeklyMenu, MEAL_LABEL, MEAL_KEYS, type MealKey, type FoodOption } from "@/lib/rums";
 import { schedulePlan } from "@/lib/scheduler";
 import { randomBytes } from "crypto";
+import { addDaysIso, todayIso, isoToJalali, persianWeekday } from "@/lib/jalali";
 
 /* ==================== Telegram API ==================== */
+export interface TgChat { id: number; }
+export interface TgUser { id: number; first_name?: string; }
+export interface TgMessage { message_id: number; chat?: TgChat; from?: TgUser; text?: string; }
+export interface TgCallbackQuery { id: string; data?: string; from?: TgUser; message?: TgMessage; }
+export interface TgUpdate { message?: TgMessage; callback_query?: TgCallbackQuery; }
+export interface TgApiResponse { ok?: boolean; result?: { message_id?: number } & Record<string, unknown>; }
 
-/** Minimal Telegram Bot API shapes — only the fields this bot reads. */
-export interface TgChat {
-  id: number;
-}
-export interface TgUser {
-  id: number;
-  first_name?: string;
-}
-export interface TgMessage {
-  message_id: number;
-  chat?: TgChat;
-  from?: TgUser;
-  text?: string;
-}
-export interface TgCallbackQuery {
-  id: string;
-  data?: string;
-  from?: TgUser;
-  message?: TgMessage;
-}
-export interface TgUpdate {
-  message?: TgMessage;
-  callback_query?: TgCallbackQuery;
-}
-/** Bot API response envelope. */
-export interface TgApiResponse {
-  ok?: boolean;
-  result?: { message_id?: number } & Record<string, unknown>;
-}
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
 
 async function tgApi(method: string, params: Record<string, unknown> = {}): Promise<TgApiResponse | null> {
@@ -50,111 +28,44 @@ async function tgApi(method: string, params: Record<string, unknown> = {}): Prom
       signal: AbortSignal.timeout(20000),
     });
     return (await res.json().catch(() => null)) as TgApiResponse | null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 const tgSend = (chatId: number | string, text: string, extra: Record<string, unknown> = {}) =>
-  tgApi("sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    ...extra,
-  });
-
-const tgAnswerCb = (id: string, text = "") =>
-  tgApi("answerCallbackQuery", { callback_query_id: id, text });
-
-const tgDelete = (chatId: number | string, messageId: number) =>
-  tgApi("deleteMessage", { chat_id: chatId, message_id: messageId });
-
-const tgEditMarkup = (chatId: number | string, messageId: number, markup: unknown) =>
-  tgApi("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup: markup });
+  tgApi("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...extra });
+const tgAnswerCb = (id: string, text = "") => tgApi("answerCallbackQuery", { callback_query_id: id, text });
 
 function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function faDigits(s: string): string {
-  return s.replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)));
-}
-
-/* ==================== Menus ==================== */
+/* ==================== منوها ==================== */
 const MAIN_MENU = {
   keyboard: [
-    [{ text: "🍽️ حساب سلف" }, { text: "📋 قانون رزرو" }],
-    [{ text: "🧪 تست اتصال" }, { text: "▶️ رزرو دستی" }],
-    [{ text: "📊 وضعیت من" }],
+    [{ text: "👤 اتصال حساب" }, { text: "📋 اطلاعات من" }],
+    [{ text: "🍽️ منوی هفته" }, { text: "⚙️ اتوماسیون" }],
+    [{ text: "🧪 تست اتصال" }],
   ],
   resize_keyboard: true,
 };
 
 const DAYS_FA = ["شنبه", "یکشنبه", "دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه"];
-const MEALS_FA: Record<string, string> = { lunch: "ناهار", dinner: "شام", breakfast: "صبحانه" };
-const MEAL_KEYS = ["lunch", "dinner", "breakfast"];
 
-function dayKeyboard(selected: number[]) {
-  const rows: { text: string; callback_data: string }[][] = [];
-  for (let i = 0; i < 7; i += 2) {
-    const row = [];
-    for (let j = i; j < Math.min(i + 2, 7); j++) {
-      row.push({
-        text: `${selected.includes(j) ? "✅" : "⬜"} ${DAYS_FA[j]}`,
-        callback_data: `day:${j}`,
-      });
-    }
-    rows.push(row);
-  }
-  rows.push([{ text: "✅ تأیید", callback_data: "days_done" }]);
-  return { inline_keyboard: rows };
-}
-
-function mealKeyboard(selected: string[]) {
-  const row = MEAL_KEYS.map((k) => ({
-    text: `${selected.includes(k) ? "✅" : "⬜"} ${MEALS_FA[k]}`,
-    callback_data: `meal:${k}`,
-  }));
-  return { inline_keyboard: [row, [{ text: "✅ تأیید", callback_data: "meals_done" }]] };
-}
-
-const FOOD_MENU = {
-  inline_keyboard: [
-    [{ text: "🥇 اولین غذای موجود", callback_data: "food:first" }],
-    [{ text: "💰 ارزان‌ترین غذا", callback_data: "food:cheapest" }],
-    [{ text: "✏️ نام غذای خاص", callback_data: "food:custom" }],
-  ],
-};
-
-const RESERVE_MENU = {
-  inline_keyboard: [
-    [{ text: "▶️ رزرو واقعی", callback_data: "do:real" }],
-    [{ text: "🧪 تست (بدون رزرو واقعی)", callback_data: "do:dry" }],
-  ],
-};
-
-/* ==================== Account & state ==================== */
+/* ==================== مدیریت حساب ==================== */
 async function getOrCreateAccount(tgId: string, chatId: number, firstName: string) {
   let [user] = await db.select().from(users).where(eq(users.telegramId, tgId));
   if (!user) {
-    const created = await db
-      .insert(users)
-      .values({
-        email: `tg${tgId}@telegram.local`,
-        name: firstName || "کاربر تلگرام",
-        passwordHash: hashPassword(randomBytes(16).toString("hex")),
-        telegramId: tgId,
-      })
-      .returning();
+    const created = await db.insert(users).values({
+      email: `tg${tgId}@telegram.local`,
+      name: firstName || "کاربر تلگرام",
+      passwordHash: hashPassword(randomBytes(16).toString("hex")),
+      telegramId: tgId,
+    }).returning();
     user = created[0];
   }
   let [profile] = await db.select().from(profiles).where(eq(profiles.userId, user.id));
   if (!profile) {
-    const created = await db
-      .insert(profiles)
-      .values({ userId: user.id, username: "", telegramChatId: String(chatId) })
-      .returning();
+    const created = await db.insert(profiles).values({ userId: user.id, username: "", telegramChatId: String(chatId) }).returning();
     profile = created[0];
   } else if (!profile.telegramChatId) {
     await db.update(profiles).set({ telegramChatId: String(chatId) }).where(eq(profiles.id, profile.id));
@@ -163,387 +74,408 @@ async function getOrCreateAccount(tgId: string, chatId: number, firstName: strin
   return { user, profile };
 }
 
-async function getOrCreatePlan(profileId: number) {
-  let [plan] = await db.select().from(plans).where(eq(plans.profileId, profileId));
-  if (!plan) {
-    const created = await db
-      .insert(plans)
-      .values({ profileId, name: "قانون اصلی" })
-      .returning();
-    plan = created[0];
-  }
-  return plan;
-}
-
 type BotStateRow = { state: string; data: Record<string, unknown> };
-
 async function getState(tgId: string): Promise<BotStateRow> {
   const [s] = await db.select().from(telegramStates).where(eq(telegramStates.telegramId, tgId));
   if (!s) return { state: "idle", data: {} };
   return { state: s.state, data: (s.data as Record<string, unknown>) || {} };
 }
-
 async function setState(tgId: string, userId: number, state: string, data: Record<string, unknown> = {}) {
-  await db
-    .insert(telegramStates)
-    .values({ telegramId: tgId, userId, state, data })
-    .onConflictDoUpdate({
-      target: telegramStates.telegramId,
-      set: { state, data, updatedAt: new Date() },
-    });
+  await db.insert(telegramStates).values({ telegramId: tgId, userId, state, data })
+    .onConflictDoUpdate({ target: telegramStates.telegramId, set: { state, data, updatedAt: new Date() } });
 }
 
-function fmtDays(days: number[]): string {
-  if (!days.length) return "—";
-  return [...days].sort((a, b) => a - b).map((d) => DAYS_FA[d]).join("، ");
-}
-
-function fmtMeals(meals: string[]): string {
-  if (!meals.length) return "—";
-  return meals.map((m) => MEALS_FA[m] || m).join("، ");
-}
-
-function fmtFood(plan: { foodPreference: string }): string {
-  if (plan.foodPreference === "first") return "اولین غذای موجود";
-  if (plan.foodPreference === "cheapest") return "ارزان‌ترین";
-  return `خاص: ${plan.foodPreference}`;
-}
-
-function fmtTime(h: number, m: number): string {
-  return `${h}:${String(m).padStart(2, "0")}`;
-}
-
-async function planSummary(planId: number): Promise<string> {
-  const [plan] = await db.select().from(plans).where(eq(plans.id, planId));
-  if (!plan) return "تنظیم نشده";
-  return (
-    `📅 روزها: ${fmtDays((plan.weekdays as number[]) || [])}\n` +
-    `🍽️ وعده‌ها: ${fmtMeals((plan.meals as string[]) || [])}\n` +
-    `🥘 غذا: ${esc(fmtFood(plan))}\n` +
-    `⏰ ساعت اجرا: ${fmtTime(plan.runAtHour, plan.runAtMinute)}`
-  );
-}
-
-/* ==================== Flows ==================== */
+/* ==================== فلوی شروع ==================== */
 async function startFlow(chatId: number, tgId: string, firstName: string) {
-  const { profile } = await getOrCreateAccount(tgId, chatId, firstName);
-  const [user] = await db.select().from(users).where(eq(users.telegramId, tgId));
-  await setState(tgId, user.id, "idle", {});
-  const hasCreds = !!profile.username;
-  await tgSend(
-    chatId,
-    `👋 سلام <b>${esc(firstName)}</b>!\n\n` +
-      `به ربات رزرو خودکار غذای سلف خوش اومدی 🍽️\n\n` +
-      `اینجا می‌تونی حساب سامانه سلف دانشگاهت رو وصل کنی و قانون رزرو بچینی تا هر روز خودش برات رزرو کنه.\n\n` +
-      (hasCreds
-        ? `حساب سلف وصله ✅ از منوی زیر انتخاب کن 👇`
-        : `برای شروع، دکمه «🍽️ حساب سلف» رو بزن 👇`),
-    { reply_markup: MAIN_MENU }
-  );
-}
-
-async function accountFlow(chatId: number, tgId: string, userId: number, profileId: number) {
-  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
-  const masked = profile?.username ? ` (فعلی: <code>${esc(profile.username.slice(0, 3))}***</code>)` : "";
-  await setState(tgId, userId, "await_student_id", { profileId });
-  await tgSend(chatId, `🎓 شماره دانشجوییت رو بفرست:${masked}`, { reply_markup: { remove_keyboard: true } });
-}
-
-async function testConnection(chatId: number, profileId: number) {
-  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
-  if (!profile || !profile.username) {
-    await tgSend(chatId, `اول «🍽️ حساب سلف» رو تنظیم کن 👆`, { reply_markup: MAIN_MENU });
-    return;
-  }
-  const waitMsg = await tgSend(chatId, `🧪 در حال تست اتصال به سامانه سلف...`);
-  const probe = await probeProfile(profile);
-  const status = probe.reachable
-    ? `✅ سایت در دسترسه (کد ${probe.status})`
-    : `❌ سایت در دسترس نیست${probe.error ? `\nعلت: <code>${esc(probe.error)}</code>` : ""}\n\n💡 سرور ما خارج از ایرانه و سایت دانشگاه آیپی خارجی رو محدود کرده. داریم راه‌حلش رو پیدا می‌کنیم.`;
-  try {
-    await tgApi("editMessageText", {
-      chat_id: chatId,
-      message_id: waitMsg?.result?.message_id,
-      text: status,
-      parse_mode: "HTML",
-    });
-  } catch {
-    await tgSend(chatId, status);
-  }
-  await tgSend(chatId, `منوی اصلی 👇`, { reply_markup: MAIN_MENU });
-}
-
-async function statusFlow(chatId: number, profileId: number) {
-  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
-  if (!profile) return;
-  const plan = await getOrCreatePlan(profileId);
-  const [lastRun] = await db.select().from(runs).where(eq(runs.profileId, profileId)).orderBy(desc(runs.id)).limit(1);
-  const lines = [
-    `📊 <b>وضعیت تو</b>`,
-    ``,
-    `🎓 شماره دانشجویی: ${profile.username ? `<code>${esc(profile.username)}</code>` : "تنظیم نشده"}`,
-    `🍽️ حساب سلف: ${profile.username ? "✅" : "❌"}`,
-    `📋 قانون رزرو: ${plan.active ? "✅ فعال" : "⏸️ غیرفعال"}`,
-    await planSummary(plan.id),
-    ``,
-    `🕐 آخرین اجرا: ${lastRun ? `${lastRun.status} (${lastRun.booked} رزرو)` : "—"}`,
-    `⏭️ اجرای بعدی: ${plan.nextRunAt ? new Date(plan.nextRunAt).toLocaleString("fa-IR") : "—"}`,
-  ];
-  await tgSend(chatId, lines.join("\n"), { reply_markup: MAIN_MENU });
-}
-
-async function manualReserve(chatId: number, profileId: number) {
-  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
-  if (!profile?.username) {
-    await tgSend(chatId, `اول «🍽️ حساب سلف» رو تنظیم کن 👆`, { reply_markup: MAIN_MENU });
-    return;
-  }
-  await tgSend(chatId, `رزرو دستی — واقعی انجام بشه یا فقط تست؟`, { reply_markup: RESERVE_MENU });
-}
-
-async function doReserve(chatId: number, profileId: number, dryRun: boolean) {
-  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
-  const plan = await getOrCreatePlan(profileId);
-  if (!profile) return;
-  await tgSend(chatId, dryRun ? `🧪 تست شروع شد...` : `▶️ رزرو شروع شد...`);
-  try {
-    const result = await executePlan({ profile, plan, trigger: "manual", options: { dryRun } });
-    const icon = result.status === "success" ? "✅" : result.status === "partial" ? "⚠️" : "❌";
-    await tgSend(
-      chatId,
-      `${icon} <b>نتیجه ${dryRun ? "تست" : "رزرو"}</b>\n\n` +
-        `📝 ${esc(result.message)}\n` +
-        `✅ موفق: ${result.booked} | ⏭️ رد شده: ${result.skipped} | ❌ ناموفق: ${result.failed}` +
-        (result.simulated ? `\n\n💡 <i>حالت شبیه‌سازی (سایت در دسترس نبود)</i>` : ""),
-      { reply_markup: MAIN_MENU }
-    );
-  } catch (e) {
-    await tgSend(chatId, `❌ خطا: <code>${esc(e instanceof Error ? e.message : String(e))}</code>`, {
-      reply_markup: MAIN_MENU,
-    });
-  }
-}
-
-/* ==================== Plan setup ==================== */
-async function planFlow(chatId: number, tgId: string, userId: number, profileId: number) {
-  const plan = await getOrCreatePlan(profileId);
-  await setState(tgId, userId, "plan_days", {
-    profileId,
-    planId: plan.id,
-    days: (plan.weekdays as number[]) || [0, 1, 2, 3, 4],
-  });
-  const st = await getState(tgId);
-  await tgSend(chatId, `📅 روزهای هفته برای رزرو رو انتخاب کن:\n(بزن تا فعال/غیرفعال بشه، آخرش ✅ تأیید)`, {
-    reply_markup: dayKeyboard(st.data.days as number[]),
-  });
-}
-
-/* ==================== Message handler ==================== */
-export async function handleMessage(msg: TgMessage) {
-  const chatId = msg.chat?.id;
-  const tgId = String(msg.from?.id);
-  const firstName = msg.from?.first_name || "";
-  const text = (msg.text || "").trim();
-  if (!chatId || !tgId) return;
-
   const { user, profile } = await getOrCreateAccount(tgId, chatId, firstName);
-  const st = await getState(tgId);
+  await setState(tgId, user.id, "idle", {});
 
-  // دستورات اصلی
-  if (text === "/start" || text === "شروع") {
-    await startFlow(chatId, tgId, firstName);
-    return;
+  // اگه قبلاً لاگین کرده، اسم و موجودی رو نشون بده
+  const [info] = await db.select().from(userInfo).where(eq(userInfo.profileId, profile.id));
+
+  await tgSend(chatId,
+    `👋 سلام <b>${esc(firstName)}</b>!\n\n` +
+    `به ربات رزرو خودکار غذای سلف خوش اومدی 🍽️\n\n` +
+    (info?.fullName
+      ? `👤 ${esc(info.fullName)}\n💰 موجودی: <b>${(info.balance ?? 0).toLocaleString("fa-IR")}</b> تومان\n\n`
+      : `هنوز حسابت رو وصل نکردی. دکمه «👤 اتصال حساب» رو بزن 👇\n\n`) +
+    `از منوی زیر انتخاب کن:`,
+    { reply_markup: MAIN_MENU });
+}
+
+/* ==================== فلوی اتصال حساب ==================== */
+async function connectFlow(chatId: number, tgId: string, userId: number, profileId: number) {
+  await setState(tgId, userId, "await_username", { profileId });
+  await tgSend(chatId, `👤 <b>اتصال حساب سلف</b>\n\nنام کاربری سامانه سلف (شماره دانشجویی) رو بفرست:`,
+    { reply_markup: { remove_keyboard: true } });
+}
+
+async function handleUsername(chatId: number, tgId: string, userId: number, data: Record<string, unknown>, text: string) {
+  const username = text.trim();
+  if (!username) { await tgSend(chatId, `نام کاربری نمی‌تونه خالی باشه. دوباره بفرست:`); return; }
+  await setState(tgId, userId, "await_password", { ...data, username });
+  await tgSend(chatId, `🔑 حالا رمز عبورت رو بفرست:\n\n<i>⚠️ رمزت با AES-256 رمزنگاری می‌شه و فقط برای ورود به سامانه سلف استفاده می‌شه.</i>`);
+}
+
+async function handlePassword(chatId: number, tgId: string, userId: number, data: Record<string, unknown>, text: string) {
+  const password = text.trim();
+  const profileId = data.profileId as number;
+  const username = data.username as string;
+
+  await tgSend(chatId, `⏳ دارم وصل می‌شم...`);
+
+  // ذخیره موقت و تست لاگین
+  await db.update(profiles).set({
+    username,
+    passwordEnc: encryptSecret(password),
+    updatedAt: new Date(),
+  }).where(eq(profiles.id, profileId));
+
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
+
+  // گرفتن اطلاعات پروفایل (نام + موجودی)
+  const info = await fetchUserProfileInfo(profile);
+
+  if (info) {
+    await db.insert(userInfo).values({
+      profileId,
+      fullName: info.fullName,
+      balance: info.balance,
+      studentId: info.studentId,
+    }).onConflictDoUpdate({
+      target: userInfo.profileId,
+      set: { fullName: info.fullName, balance: info.balance, studentId: info.studentId, updatedAt: new Date() },
+    });
+
+    await setState(tgId, userId, "idle", {});
+    await tgSend(chatId,
+      `✅ <b>خوش اومدی ${esc(info.fullName)}!</b> 🎉\n\n` +
+      `💰 موجودی حسابت: <b>${info.balance.toLocaleString("fa-IR")}</b> تومان\n\n` +
+      `حالا می‌تونی:\n` +
+      `🍽️ «منوی هفته» رو ببینی\n` +
+      `⚙️ «اتوماسیون» رو تنظیم کنی تا خودش برات رزرو کنه`,
+      { reply_markup: MAIN_MENU });
+  } else {
+    await setState(tgId, userId, "idle", {});
+    await tgSend(chatId,
+      `❌ <b>ورود ناموفق بود.</b>\n\n` +
+      `نام کاربری یا رمز اشتباهه، یا سامانه سلف در دسترس نیست.\n` +
+      `دوباره «👤 اتصال حساب» رو بزن.`,
+      { reply_markup: MAIN_MENU });
   }
-  if (text === "🍽️ حساب سلف") {
-    await accountFlow(chatId, tgId, user.id, profile.id);
-    return;
-  }
-  if (text === "📋 قانون رزرو") {
-    await planFlow(chatId, tgId, user.id, profile.id);
-    return;
-  }
-  if (text === "🧪 تست اتصال") {
-    await testConnection(chatId, profile.id);
-    return;
-  }
-  if (text === "▶️ رزرو دستی") {
-    await manualReserve(chatId, profile.id);
-    return;
-  }
-  if (text === "📊 وضعیت من") {
-    await statusFlow(chatId, profile.id);
+}
+
+/* ==================== اطلاعات من ==================== */
+async function myInfoFlow(chatId: number, profileId: number) {
+  const [info] = await db.select().from(userInfo).where(eq(userInfo.profileId, profileId));
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
+
+  if (!info?.fullName) {
+    await tgSend(chatId, `هنوز حسابت رو وصل نکردی. اول «👤 اتصال حساب» رو بزن.`, { reply_markup: MAIN_MENU });
     return;
   }
 
-  // وضعیت‌های مکالمه
-  if (st.state === "await_student_id") {
-    const studentId = faDigits(text).replace(/\s+/g, "");
-    if (!studentId) {
-      await tgSend(chatId, `شماره دانشجویی معتبر نیست، دوباره بفرست:`);
-      return;
+  // رزروهای اخیر
+  const recent = await db.select().from(reservations)
+    .where(eq(reservations.profileId, profileId))
+    .orderBy(desc(reservations.serviceDate))
+    .limit(7);
+
+  let msg = `📋 <b>اطلاعات من</b>\n\n` +
+    `👤 نام: <b>${esc(info.fullName)}</b>\n` +
+    `💰 موجودی: <b>${(info.balance ?? 0).toLocaleString("fa-IR")}</b> تومان\n` +
+    `🎓 شماره دانشجویی: <code>${esc(profile.username)}</code>\n\n`;
+
+  if (recent.length) {
+    msg += `📅 <b>رزروهای اخیر:</b>\n`;
+    for (const r of recent) {
+      const mealFa = MEAL_LABEL[r.meal as MealKey] || r.meal;
+      msg += `• ${r.jalaliDate} - ${mealFa}: ${esc(r.foodName)} ${r.status === "booked" ? "✅" : "❌"}\n`;
     }
-    await db.update(profiles).set({ username: studentId }).where(eq(profiles.id, profile.id));
-    await setState(tgId, user.id, "await_password", { profileId: profile.id });
-    await tgSend(chatId, `🔑 حالا رمز سامانه سلف رو بفرست:\n⚠️ پیامت رو بعد از خوندن پاک می‌کنم.`);
+  } else {
+    msg += `هنوز رزروی ثبت نشده.`;
+  }
+
+  await tgSend(chatId, msg, { reply_markup: MAIN_MENU });
+}
+
+/* ==================== منوی هفته ==================== */
+async function weekMenuFlow(chatId: number, profileId: number) {
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
+  if (!profile.username) {
+    await tgSend(chatId, `اول حسابت رو وصل کن: «👤 اتصال حساب»`, { reply_markup: MAIN_MENU });
     return;
   }
 
-  if (st.state === "await_password") {
-    const password = text;
-    if (!password) {
-      await tgSend(chatId, `رمز رو بفرست:`);
-      return;
-    }
-    await db
-      .update(profiles)
-      .set({ passwordEnc: encryptSecret(password) })
-      .where(eq(profiles.id, profile.id));
-    await setState(tgId, user.id, "idle", {});
-    try {
-      await tgDelete(chatId, msg.message_id);
-    } catch { /* ignore */ }
-    await tgSend(chatId, `✅ حسابت ذخیره شد! در حال تست اتصال...`);
-    await testConnection(chatId, profile.id);
+  await tgSend(chatId, `⏳ دارم منوی هفته رو می‌گیرم...`);
+
+  const today = todayIso(profile.timezone);
+  const days: string[] = [];
+  for (let i = 0; i < 7; i++) days.push(addDaysIso(today, i));
+
+  const items = await fetchWeeklyMenu(profile, days);
+
+  if (!items.length) {
+    await tgSend(chatId, `❌ نتونستم منو رو بگیرم. سامانه سلف در دسترس نیست.`, { reply_markup: MAIN_MENU });
     return;
   }
 
-  if (st.state === "await_food_name") {
-    const name = text.slice(0, 60);
-    const planId = st.data.planId as number;
-    await db.update(plans).set({ foodPreference: name }).where(eq(plans.id, planId));
-    await setState(tgId, user.id, "await_time", { planId, profileId: profile.id });
-    await tgSend(chatId, `⏰ ساعت اجرای روزانه رو بفرست (مثلاً <code>8:05</code>):`);
+  // کش کردن منو
+  const weekStart = days[0];
+  await db.insert(weeklyMenuCache).values({ profileId, weekStart, menuData: items })
+    .onConflictDoUpdate({ target: [weeklyMenuCache.profileId, weeklyMenuCache.weekStart], set: { menuData: items, cachedAt: new Date() } });
+
+  // گروه‌بندی بر اساس روز
+  let msg = `🍽️ <b>منوی هفته</b>\n\n`;
+  for (const date of days) {
+    const dayItems = items.filter(i => i.date === date);
+    if (!dayItems.length) continue;
+    const wd = persianWeekday(date);
+    msg += `📅 <b>${DAYS_FA[wd]} ${isoToJalali(date)}</b>\n`;
+    for (const meal of MEAL_KEYS) {
+      const mealItems = dayItems.filter(i => i.meal === meal);
+      if (!mealItems.length) continue;
+      msg += `  ${MEAL_LABEL[meal]}:\n`;
+      for (const item of mealItems.slice(0, 4)) {
+        msg += `    • ${esc(item.name)}${item.price ? ` - ${item.price.toLocaleString("fa-IR")} ت` : ""}\n`;
+      }
+    }
+    msg += `\n`;
+  }
+
+  await tgSend(chatId, msg, { reply_markup: MAIN_MENU });
+}
+
+/* ==================== اتوماسیون ==================== */
+function automationMenu() {
+  return {
+    inline_keyboard: [
+      [{ text: "📅 تنظیم غذای هر روز", callback_data: "auto:days" }],
+      [{ text: "📋 مشاهده تنظیمات فعلی", callback_data: "auto:view" }],
+      [{ text: "🗑️ پاک کردن همه", callback_data: "auto:clear" }],
+    ],
+  };
+}
+
+async function automationFlow(chatId: number) {
+  await tgSend(chatId,
+    `⚙️ <b>اتوماسیون رزرو</b>\n\n` +
+    `اینجا می‌تونی برای هر روز هفته و هر وعده، دقیقاً مشخص کنی کدوم غذا خودکار رزرو بشه.\n\n` +
+    `مثلاً: «شنبه‌ها ناهار ماکارونی» یا «پنجشنبه‌ها ساعت ۶ شام کباب»`,
+    { reply_markup: automationMenu() });
+}
+
+function dayPickerKeyboard() {
+  const rows = [];
+  for (let i = 0; i < 7; i += 2) {
+    const row = [];
+    for (let j = i; j < Math.min(i + 2, 7); j++) {
+      row.push({ text: DAYS_FA[j], callback_data: `autoday:${j}` });
+    }
+    rows.push(row);
+  }
+  return { inline_keyboard: rows };
+}
+
+function mealPickerKeyboard(day: number) {
+  return {
+    inline_keyboard: [
+      MEAL_KEYS.map(k => ({ text: MEAL_LABEL[k], callback_data: `automeal:${day}:${k}` })),
+    ],
+  };
+}
+
+async function handleAutoDay(chatId: number, msgId: number, cbId: string, day: number, profileId: number) {
+  await tgAnswerCb(cbId);
+  await tgApi("editMessageText", {
+    chat_id: chatId, message_id: msgId,
+    text: `📅 <b>${DAYS_FA[day]}</b>\n\nکدوم وعده رو می‌خوای تنظیم کنی؟`,
+    parse_mode: "HTML",
+    reply_markup: mealPickerKeyboard(day),
+  });
+}
+
+async function handleAutoMeal(chatId: number, msgId: number, cbId: string, day: number, meal: string, profileId: number) {
+  await tgAnswerCb(cbId, "⏳ دارم غذاها رو می‌گیرم...");
+
+  // گرفتن منو از کش یا سامانه
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
+  const today = todayIso(profile.timezone);
+
+  // پیدا کردن تاریخی که همون روز هفته باشه
+  let targetDate = "";
+  for (let i = 0; i < 14; i++) {
+    const d = addDaysIso(today, i);
+    if (persianWeekday(d) === day) { targetDate = d; break; }
+  }
+
+  const items = await fetchWeeklyMenu(profile, [targetDate]);
+  const mealItems = items.filter(i => i.meal === meal && i.date === targetDate);
+
+  if (!mealItems.length) {
+    await tgApi("editMessageText", {
+      chat_id: chatId, message_id: msgId,
+      text: `❌ برای ${DAYS_FA[day]} ${MEAL_LABEL[meal as MealKey]} غذایی پیدا نشد.\nممکنه منو هنوز منتشر نشده باشه.`,
+      parse_mode: "HTML",
+    });
     return;
   }
 
-  if (st.state === "await_time") {
-    const m = faDigits(text).match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);
-    if (!m) {
-      await tgSend(chatId, `قالب ساعت درست نیست. مثلاً <code>8:05</code> بفرست:`);
-      return;
-    }
-    const h = parseInt(m[1], 10);
-    const min = parseInt(m[2], 10);
-    if (h > 23 || min > 59) {
-      await tgSend(chatId, `ساعت نامعتبره. دوباره بفرست:`);
-      return;
-    }
-    const planId = st.data.planId as number;
-    await db.update(plans).set({ runAtHour: h, runAtMinute: min, active: true }).where(eq(plans.id, planId));
-    await schedulePlan(planId);
-    await setState(tgId, user.id, "idle", {});
-    await tgSend(
-      chatId,
-      `✅ <b>قانون رزرو فعال شد!</b>\n\n${await planSummary(planId)}\n\n🤖 هر روز سر همین ساعت خودکار برات رزرو می‌کنم.`,
-      { reply_markup: MAIN_MENU }
+  // دکمه‌های انتخاب غذا
+  const rows = mealItems.slice(0, 8).map((item, idx) => [{
+    text: `${item.available ? "🟢" : "🔴"} ${item.name}${item.price ? ` (${item.price.toLocaleString("fa-IR")})` : ""}`,
+    callback_data: `autofood:${day}:${meal}:${idx}`,
+  }]);
+  rows.push([{ text: "❌ هیچکدوم (رزرو نکن)", callback_data: `autofood:${day}:${meal}:none` }]);
+
+  // ذخیره موقت لیست غذاها در state
+  const [user] = await db.select().from(users).where(eq(users.id, profile.userId));
+  if (user?.telegramId) {
+    await setState(user.telegramId, user.id, "picking_food", { profileId, day, meal, foods: mealItems.map(f => ({ id: f.id, name: f.name })) });
+  }
+
+  await tgApi("editMessageText", {
+    chat_id: chatId, message_id: msgId,
+    text: `🍽️ <b>${DAYS_FA[day]} - ${MEAL_LABEL[meal as MealKey]}</b>\n\nکدوم غذا خودکار رزرو بشه؟`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function handleAutoFood(chatId: number, msgId: number, cbId: string, day: number, meal: string, foodIdx: string, tgId: string, userId: number) {
+  const { data } = await getState(tgId);
+  const profileId = data.profileId as number;
+  const foods = data.foods as { id: string; name: string }[];
+
+  await tgAnswerCb(cbId);
+
+  if (foodIdx === "none") {
+    await db.delete(foodPreferences).where(
+      and(eq(foodPreferences.profileId, profileId), eq(foodPreferences.dayOfWeek, day), eq(foodPreferences.meal, meal))
     );
-    return;
+    await tgApi("editMessageText", {
+      chat_id: chatId, message_id: msgId,
+      text: `✅ برای <b>${DAYS_FA[day]} ${MEAL_LABEL[meal as MealKey]}</b> رزرو خودکار <b>غیرفعال</b> شد.`,
+      parse_mode: "HTML",
+    });
+  } else {
+    const food = foods[parseInt(foodIdx)];
+    if (!food) {
+      await tgApi("editMessageText", { chat_id: chatId, message_id: msgId, text: `❌ خطا. دوباره تلاش کن.`, parse_mode: "HTML" });
+      return;
+    }
+    await db.insert(foodPreferences).values({ profileId, dayOfWeek: day, meal, foodName: food.name, foodId: food.id, autoReserve: true })
+      .onConflictDoUpdate({
+        target: [foodPreferences.profileId, foodPreferences.dayOfWeek, foodPreferences.meal],
+        set: { foodName: food.name, foodId: food.id, autoReserve: true, updatedAt: new Date() },
+      });
+    await tgApi("editMessageText", {
+      chat_id: chatId, message_id: msgId,
+      text: `✅ تنظیم شد!\n\n📅 ${DAYS_FA[day]}\n🍽️ ${MEAL_LABEL[meal as MealKey]}\n🥘 <b>${esc(food.name)}</b>\n\nهر هفته خودکار رزرو می‌شه 🎉`,
+      parse_mode: "HTML",
+    });
   }
-
-  // پیش‌فرض
-  await tgSend(chatId, `از منوی زیر انتخاب کن 👇`, { reply_markup: MAIN_MENU });
+  await setState(tgId, userId, "idle", {});
 }
 
-/* ==================== Callback handler ==================== */
-export async function handleCallback(cb: TgCallbackQuery) {
-  const chatId = cb.message?.chat?.id;
-  const messageId = cb.message?.message_id;
-  const tgId = String(cb.from?.id);
-  const data = cb.data || "";
-  if (!chatId || !tgId) return;
-  await tgAnswerCb(cb.id);
+async function viewAutomation(chatId: number, msgId: number, cbId: string, profileId: number) {
+  await tgAnswerCb(cbId);
+  const prefs = await db.select().from(foodPreferences).where(eq(foodPreferences.profileId, profileId));
 
-  const [user] = await db.select().from(users).where(eq(users.telegramId, tgId));
-  if (!user) return;
-  const st = await getState(tgId);
-  const [action, param] = data.split(":");
-
-  if (action === "day" && st.state === "plan_days") {
-    const days = [...((st.data.days as number[]) || [])];
-    const n = parseInt(param, 10);
-    const i = days.indexOf(n);
-    if (i >= 0) days.splice(i, 1);
-    else days.push(n);
-    await setState(tgId, user.id, "plan_days", { ...st.data, days });
-    if (messageId) await tgEditMarkup(chatId, messageId, dayKeyboard(days));
-    return;
-  }
-
-  if (data === "days_done" && st.state === "plan_days") {
-    const days = (st.data.days as number[]) || [];
-    const planId = st.data.planId as number;
-    await db.update(plans).set({ weekdays: days }).where(eq(plans.id, planId));
-    const plan = await getOrCreatePlan(st.data.profileId as number);
-    await setState(tgId, user.id, "plan_meals", {
-      ...st.data,
-      meals: (plan.meals as string[]) || ["lunch"],
-    });
-    const nst = await getState(tgId);
+  if (!prefs.length) {
     await tgApi("editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text: `🍽️ وعده‌های غذایی رو انتخاب کن:`,
+      chat_id: chatId, message_id: msgId,
+      text: `هنوز چیزی تنظیم نکردی.\n«📅 تنظیم غذای هر روز» رو بزن.`,
       parse_mode: "HTML",
-      reply_markup: mealKeyboard(nst.data.meals as string[]),
+      reply_markup: automationMenu(),
     });
     return;
   }
 
-  if (action === "meal" && st.state === "plan_meals") {
-    const meals = [...((st.data.meals as string[]) || [])];
-    const i = meals.indexOf(param);
-    if (i >= 0) meals.splice(i, 1);
-    else meals.push(param);
-    await setState(tgId, user.id, "plan_meals", { ...st.data, meals });
-    if (messageId) await tgEditMarkup(chatId, messageId, mealKeyboard(meals));
-    return;
+  let msg = `⚙️ <b>تنظیمات فعلی اتوماسیون:</b>\n\n`;
+  const sorted = [...prefs].sort((a, b) => a.dayOfWeek - b.dayOfWeek);
+  for (const p of sorted) {
+    msg += `📅 ${DAYS_FA[p.dayOfWeek]} - ${MEAL_LABEL[p.meal as MealKey]}: <b>${esc(p.foodName || "?")}</b>\n`;
   }
 
-  if (data === "meals_done" && st.state === "plan_meals") {
-    const meals = (st.data.meals as string[]) || [];
-    const planId = st.data.planId as number;
-    await db.update(plans).set({ meals }).where(eq(plans.id, planId));
-    await setState(tgId, user.id, "plan_food", st.data);
-    await tgApi("editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text: `🥘 غذات چطور انتخاب بشه؟`,
-      parse_mode: "HTML",
-      reply_markup: FOOD_MENU,
-    });
-    return;
-  }
+  await tgApi("editMessageText", { chat_id: chatId, message_id: msgId, text: msg, parse_mode: "HTML", reply_markup: automationMenu() });
+}
 
-  if (action === "food" && st.state === "plan_food") {
-    const planId = st.data.planId as number;
-    if (param === "custom") {
-      await setState(tgId, user.id, "await_food_name", st.data);
-      await tgSend(chatId, `✏️ اسم غذای موردنظرت رو بفرست (مثلاً <code>چلوکباب</code>):`);
-    } else {
-      await db.update(plans).set({ foodPreference: param }).where(eq(plans.id, planId));
-      await setState(tgId, user.id, "await_time", st.data);
-      await tgSend(chatId, `⏰ ساعت اجرای روزانه رو بفرست (مثلاً <code>8:05</code>):`);
-    }
-    return;
-  }
-
-  if (action === "do") {
-    const [profile] = await db.select().from(profiles).where(eq(profiles.userId, user.id));
-    if (!profile) return;
-    await doReserve(chatId, profile.id, param === "dry");
-    return;
+/* ==================== تست اتصال ==================== */
+async function testFlow(chatId: number, profileId: number) {
+  const [profile] = await db.select().from(profiles).where(eq(profiles.id, profileId));
+  await tgSend(chatId, `⏳ دارم تست می‌کنم...`);
+  const result = await probeProfile(profile);
+  if (result.reachable) {
+    await tgSend(chatId, `✅ <b>اتصال برقرار شد!</b>\n\nسامانه سلف در دسترسه.`, { reply_markup: MAIN_MENU });
+  } else {
+    await tgSend(chatId, `❌ <b>سایت در دسترس نیست</b>\nعلت: ${esc(result.error || "نامشخص")}`, { reply_markup: MAIN_MENU });
   }
 }
 
-/* ==================== Entry ==================== */
-export async function handleTelegramUpdate(update: TgUpdate) {
-  try {
-    if (update.callback_query) {
-      await handleCallback(update.callback_query);
-    } else if (update.message) {
-      await handleMessage(update.message);
+/* ==================== هندلر اصلی ==================== */
+export async function handleUpdate(update: TgUpdate): Promise<void> {
+  // پیام متنی
+  const msg = update.message;
+  if (msg?.text && msg.chat && msg.from) {
+    const chatId = msg.chat.id;
+    const tgId = String(msg.from.id);
+    const text = msg.text.trim();
+    const firstName = msg.from.first_name || "دوست";
+
+    const { user, profile } = await getOrCreateAccount(tgId, chatId, firstName);
+    const { state, data } = await getState(tgId);
+
+    // دستورات اصلی منو
+    if (text === "/start") { await startFlow(chatId, tgId, firstName); return; }
+    if (text === "👤 اتصال حساب") { await connectFlow(chatId, tgId, user.id, profile.id); return; }
+    if (text === "📋 اطلاعات من") { await myInfoFlow(chatId, profile.id); return; }
+    if (text === "🍽️ منوی هفته") { await weekMenuFlow(chatId, profile.id); return; }
+    if (text === "⚙️ اتوماسیون") { await automationFlow(chatId); return; }
+    if (text === "🧪 تست اتصال") { await testFlow(chatId, profile.id); return; }
+
+    // ماشین حالت
+    if (state === "await_username") { await handleUsername(chatId, tgId, user.id, data, text); return; }
+    if (state === "await_password") { await handlePassword(chatId, tgId, user.id, data, text); return; }
+
+    // پیش‌فرض
+    await tgSend(chatId, `از منوی زیر انتخاب کن 👇`, { reply_markup: MAIN_MENU });
+    return;
+  }
+
+  // کال‌بک اینلاین
+  const cb = update.callback_query;
+  if (cb?.data && cb.message && cb.from) {
+    const chatId = cb.message.chat?.id ?? 0;
+    const msgId = cb.message.message_id;
+    const tgId = String(cb.from.id);
+    const [cbData, ...args] = cb.data.split(":");
+
+    const { user, profile } = await getOrCreateAccount(tgId, chatId, cb.from.first_name || "");
+
+    if (cbData === "auto" && args[0] === "days") {
+      await tgAnswerCb(cb.id);
+      await tgApi("editMessageText", {
+        chat_id: chatId, message_id: msgId,
+        text: `📅 کدوم روز هفته رو می‌خوای تنظیم کنی؟`, parse_mode: "HTML",
+        reply_markup: dayPickerKeyboard(),
+      });
+    } else if (cbData === "autoday") {
+      await handleAutoDay(chatId, msgId, cb.id, parseInt(args[0]), profile.id);
+    } else if (cbData === "automeal") {
+      await handleAutoMeal(chatId, msgId, cb.id, parseInt(args[0]), args[1], profile.id);
+    } else if (cbData === "autofood") {
+      const { state } = await getState(tgId);
+      await handleAutoFood(chatId, msgId, cb.id, parseInt(args[0]), args[1], args[2], tgId, user.id);
+    } else if (cbData === "auto" && args[0] === "view") {
+      await viewAutomation(chatId, msgId, cb.id, profile.id);
+    } else if (cbData === "auto" && args[0] === "clear") {
+      await tgAnswerCb(cb.id);
+      await db.delete(foodPreferences).where(eq(foodPreferences.profileId, profile.id));
+      await tgApi("editMessageText", {
+        chat_id: chatId, message_id: msgId,
+        text: `🗑️ همه تنظیمات اتوماسیون پاک شد.`, parse_mode: "HTML", reply_markup: automationMenu(),
+      });
     }
-  } catch (e) {
-    console.error("telegram update error:", e);
   }
 }

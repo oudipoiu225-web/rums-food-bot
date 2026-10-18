@@ -251,10 +251,23 @@ function automationMenu() {
   return {
     inline_keyboard: [
       [{ text: "📅 تنظیم غذای هر روز", callback_data: "auto:days" }],
+      [{ text: "⏰ تنظیم ساعت اجرا", callback_data: "auto:time" }],
       [{ text: "📋 مشاهده تنظیمات فعلی", callback_data: "auto:view" }],
       [{ text: "🗑️ پاک کردن همه", callback_data: "auto:clear" }],
     ],
   };
+}
+
+function timePickerKeyboard() {
+  const hours = [5, 6, 7, 8, 9, 10, 12, 14, 18, 20];
+  const rows = [];
+  for (let i = 0; i < hours.length; i += 3) {
+    rows.push(hours.slice(i, i + 3).map(h => ({
+      text: `⏰ ساعت ${h}`,
+      callback_data: `autotime:${h}`,
+    })));
+  }
+  return { inline_keyboard: rows };
 }
 
 async function automationFlow(chatId: number) {
@@ -369,6 +382,18 @@ async function handleAutoFood(chatId: number, msgId: number, cbId: string, day: 
         target: [foodPreferences.profileId, foodPreferences.dayOfWeek, foodPreferences.meal],
         set: { foodName: food.name, foodId: food.id, autoReserve: true, updatedAt: new Date() },
       });
+    // ساخت/آپدیت plan برای اسکجولر (تا هفتگی اجرا بشه)
+    const existingPlans = await db.select().from(plans).where(eq(plans.profileId, profileId));
+    if (!existingPlans.length) {
+      const { computeNextRun } = await import("@/lib/scheduler");
+      const newPlan = {
+        profileId, name: "اتوماسیون بات",
+        weekdays: [0,1,2,3,4,5,6], meals: ["breakfast","lunch","dinner"],
+        foodPreference: "first", runAtHour: 6, runAtMinute: 0, active: true,
+      };
+      const nextRun = computeNextRun(newPlan, "Asia/Tehran");
+      await db.insert(plans).values({ ...newPlan, nextRunAt: nextRun });
+    }
     await tgApi("editMessageText", {
       chat_id: chatId, message_id: msgId,
       text: `✅ تنظیم شد!\n\n📅 ${DAYS_FA[day]}\n🍽️ ${MEAL_LABEL[meal as MealKey]}\n🥘 <b>${esc(food.name)}</b>\n\nهر هفته خودکار رزرو می‌شه 🎉`,
@@ -469,6 +494,32 @@ export async function handleUpdate(update: TgUpdate): Promise<void> {
       await handleAutoFood(chatId, msgId, cb.id, parseInt(args[0]), args[1], args[2], tgId, user.id);
     } else if (cbData === "auto" && args[0] === "view") {
       await viewAutomation(chatId, msgId, cb.id, profile.id);
+    } else if (cbData === "auto" && args[0] === "time") {
+      await tgAnswerCb(cb.id);
+      await tgApi("editMessageText", {
+        chat_id: chatId, message_id: msgId,
+        text: `⏰ <b>ساعت اجرای روزانه رزرو خودکار</b>
+
+هر روز چه ساعتی رزروها انجام بشه؟`,
+        parse_mode: "HTML", reply_markup: timePickerKeyboard(),
+      });
+    } else if (cbData === "autotime") {
+      const hour = parseInt(args[0]);
+      await tgAnswerCb(cb.id, `✅ ساعت ${hour} تنظیم شد`);
+      const existingPlans = await db.select().from(plans).where(eq(plans.profileId, profile.id));
+      if (existingPlans.length) {
+        const { computeNextRun } = await import("@/lib/scheduler");
+        const plan = existingPlans[0];
+        const nextRun = computeNextRun({ runAtHour: hour, runAtMinute: 0 }, "Asia/Tehran");
+        await db.update(plans).set({ runAtHour: hour, runAtMinute: 0, nextRunAt: nextRun }).where(eq(plans.id, plan.id));
+      }
+      await tgApi("editMessageText", {
+        chat_id: chatId, message_id: msgId,
+        text: `✅ ساعت اجرا تنظیم شد: <b>${hour}:00</b>
+
+هر روز این ساعت رزرو خودکار انجام می‌شه.`,
+        parse_mode: "HTML", reply_markup: automationMenu(),
+      });
     } else if (cbData === "auto" && args[0] === "clear") {
       await tgAnswerCb(cb.id);
       await db.delete(foodPreferences).where(eq(foodPreferences.profileId, profile.id));

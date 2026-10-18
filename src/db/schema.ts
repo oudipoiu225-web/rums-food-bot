@@ -219,7 +219,7 @@ export const foodPreferences = pgTable(
     autoReserve: boolean("auto_reserve").notNull().default(true),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("food_prefs_profile_idx").on(table.profileId, table.dayOfWeek, table.meal)],
+  (table) => [index("food_prefs_profile_idx").on(table.profileId, table.dayOfWeek, table.meal).unique()],
 );
 
 /**
@@ -236,7 +236,7 @@ export const weeklyMenuCache = pgTable(
     menuData: jsonb("menu_data").$type<FoodOption[]>().notNull().default([]),
     cachedAt: timestamp("cached_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("menu_cache_idx").on(table.profileId, table.weekStart)],
+  (table) => [index("menu_cache_idx").on(table.profileId, table.weekStart).unique()],
 );
 
 export type UserInfo = typeof userInfo.$inferSelect;

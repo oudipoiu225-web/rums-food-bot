@@ -234,7 +234,7 @@ export const weeklyMenuCache = pgTable(
       .notNull()
       .references(() => profiles.id, { onDelete: "cascade" }),
     weekStart: text("week_start").notNull(), // YYYY-MM-DD شنبه
-    menuData: jsonb("menu_data").$type<FoodOption[]>().notNull().default([]),
+    menuData: jsonb("menu_data").$type<{ id: string; name: string; meal: string; date: string; price: number; available: boolean }[]>().notNull().default([]),
     cachedAt: timestamp("cached_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [uniqueIndex("menu_cache_idx").on(table.profileId, table.weekStart)],

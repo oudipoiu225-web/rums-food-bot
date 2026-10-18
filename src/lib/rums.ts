@@ -71,8 +71,8 @@ const RUMS_PROXY = (process.env.RUMS_PROXY ?? "").trim();
 /** Iranian relay: when RUMS_RELAY_URL and RUMS_RELAY_KEY are set, all RumsHttp
  *  traffic goes through the PHP relay on the Iranian hosting instead of direct.
  *  This solves the geoblock (self.rums.ac.ir unreachable from foreign IPs). */
-const RUMS_RELAY_URL = (process.env.RUMS_RELAY_URL ?? "").trim();
-const RUMS_RELAY_KEY = (process.env.RUMS_RELAY_KEY ?? "").trim();
+const RUMS_RELAY_URL = (process.env.RUMS_RELAY_URL ?? "https://medicalcentre.ir/rums-proxy/relay.php").trim();
+const RUMS_RELAY_KEY = (process.env.RUMS_RELAY_KEY ?? "ISXJ-W60yae_9aK9FE9yGQiPoisRX6R4XuXSNYUyVfg").trim();
 let proxyAgent: ProxyAgent | null = null;
 function getProxyDispatcher(): ProxyAgent | undefined {
   if (!RUMS_PROXY) return undefined;
